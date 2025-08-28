@@ -1,13 +1,15 @@
-FROM golang:1.24.6-alpine
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod ./
-COPY go.sum ./
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . ./
+COPY . .
+RUN go build -o walletgenerator ./cmd/walletgenerator
 
-RUN go build -o crypto-generator main.go
+FROM alpine:3.20
+WORKDIR /root/
+COPY --from=builder /app/walletgenerator .
 
-CMD ["./crypto-generator"]
+CMD ["./walletgenerator"]
