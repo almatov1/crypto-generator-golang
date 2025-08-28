@@ -46,7 +46,7 @@ func connectRPC() *ethclient.Client {
 }
 
 func main() {
-	db, err := sql.Open("sqlite3", "./wallets.db")
+	db, err := sql.Open("sqlite3", "/addresses/wallets.db")
 	if err != nil {
 		log.Fatal(err)
 	}
