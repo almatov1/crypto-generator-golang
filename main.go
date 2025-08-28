@@ -1,141 +1,122 @@
 package main
 
 import (
-	"bufio"
-	"crypto/ecdsa"
+	"context"
 	"database/sql"
-	"encoding/hex"
-	"fmt"
 	"log"
-	"os"
-	"os/signal"
-	"runtime"
-	"sync"
-	"sync/atomic"
-	"syscall"
+	"math/big"
 	"time"
 
-	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/tyler-smith/go-bip39"
 )
 
-const (
-	defaultDB  = "database.db"
-	defaultLog = "log.txt"
-)
+var rpcs = []string{
+	"https://1rpc.io/eth",
+	"https://eth-mainnet.public.blastapi.io/",
+	"https://go.getblock.us/27eb23f40b964c9bb71b62f721e594e7",
+	"https://0xrpc.io/eth",
+	"https://ethereum.publicnode.com",
+	"https://api.blockeden.xyz/eth/67nCBdZQSH9z3YqDDjdm",
+	"https://ethereum.blockpi.network/v1/rpc/public",
+	"https://cloudflare-eth.com/v1/mainnet",
+	"https://rpc.flashbots.net/",
+	"https://public-eth.nownodes.io/",
+	"https://eth.api.onfinality.io/public",
+	"https://ethereum-rpc.polkachu.com/",
+	"https://eth-mainnet.reddio.com/",
+}
 
-var (
-	counter   uint64
-	stopFlag  uint32
-	startTime = time.Now()
-)
+func connectRPC() *ethclient.Client {
+	for {
+		for _, url := range rpcs {
+			client, err := ethclient.Dial(url)
+			if err != nil {
+				log.Println("Ошибка подключения к RPC:", url, err)
+				continue
+			}
+			log.Println("Подключено к RPC:", url)
+			return client
+		}
+		log.Println("Не удалось подключиться ни к одной RPC. Ждем 5 секунд...")
+		time.Sleep(5 * time.Second)
+	}
+}
 
 func main() {
-	maxThreads := runtime.NumCPU()
-	fmt.Printf("В системе обнаружено %d логических процессоров.\n", maxThreads)
-
-	var userThreads int
-	fmt.Println("Введите желаемое количество потоков (минимум 2):")
-	fmt.Scan(&userThreads)
-	if userThreads < 2 {
-		userThreads = 2
-	}
-	if userThreads > maxThreads {
-		userThreads = maxThreads
-	}
-
-	// Открываем базу
-	db, err := sql.Open("sqlite3", defaultDB)
+	db, err := sql.Open("sqlite3", "./wallets.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Включаем оптимизации SQLite
-	db.Exec("PRAGMA journal_mode=WAL;")
-	db.Exec("PRAGMA synchronous=NORMAL;")
-	db.Exec("PRAGMA temp_store=MEMORY;")
-
-	// Готовим statement для проверки адресов
-	stmt, err := db.Prepare("SELECT 1 FROM addresses WHERE address = ?")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS wallets (
+        address BLOB PRIMARY KEY
+    )`)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer stmt.Close()
 
-	// Готовим файл логов
-	logFile, err := os.OpenFile(defaultLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	client := connectRPC()
+	defer client.Close()
+
+	maxRows := 200_000_000
+	lastBlockHeader, err := client.HeaderByNumber(context.Background(), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer logFile.Close()
-	writer := bufio.NewWriter(logFile)
+	startBlock := lastBlockHeader.Number.Uint64() // начинаем с последнего блока
 
-	// Скорость
-	go func() {
-		for atomic.LoadUint32(&stopFlag) == 0 {
-			total := atomic.LoadUint64(&counter)
-			mins := time.Since(startTime).Minutes()
-			speed := float64(total) / (mins + 1e-9)
-			fmt.Printf("\rСкорость: %.2f адресов/мин", speed)
-			time.Sleep(time.Second)
+	for i := startBlock; i > 0; i-- {
+		block, err := client.BlockByNumber(context.Background(), big.NewInt(int64(i)))
+		if err != nil {
+			log.Println("Ошибка получения блока:", err)
+			client = connectRPC()
+			continue
 		}
-	}()
 
-	// Ctrl+C для завершения
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		atomic.StoreUint32(&stopFlag, 1)
-	}()
-
-	// Запускаем воркеров
-	var wg sync.WaitGroup
-	for i := 0; i < userThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for atomic.LoadUint32(&stopFlag) == 0 {
-				entropy, _ := bip39.NewEntropy(128)
-				mnemonic, _ := bip39.NewMnemonic(entropy)
-				seed := bip39.NewSeed(mnemonic, "")
-
-				// Приватный ключ
-				privKey, err := crypto.ToECDSA(seed[:32])
+		inserted := 0
+		for _, tx := range block.Transactions() {
+			// from
+			var from common.Address
+			chainID := tx.ChainId()
+			if chainID != nil && chainID.Sign() != 0 {
+				from, err = types.Sender(types.LatestSignerForChainID(chainID), tx)
 				if err != nil {
 					continue
 				}
-				pubKey := privKey.Public().(*ecdsa.PublicKey)
-				addr := crypto.PubkeyToAddress(*pubKey)
-
-				atomic.AddUint64(&counter, 1)
-
-				// Проверка адреса через prepared statement
-				if checkAddress(stmt, addr.Bytes()) {
-					saveToFile(writer, mnemonic, addr.Hex(), "0x"+hex.EncodeToString(privKey.D.Bytes()))
+			} else {
+				// fallback для "старых" или странных tx
+				from, err = types.Sender(types.HomesteadSigner{}, tx)
+				if err != nil {
+					continue
 				}
 			}
-		}()
+
+			if err == nil {
+				_, _ = db.Exec("INSERT OR IGNORE INTO wallets(address) VALUES(?)", from.Bytes())
+				inserted++
+			}
+
+			// to
+			if tx.To() != nil {
+				_, _ = db.Exec("INSERT OR IGNORE INTO wallets(address) VALUES(?)", tx.To().Bytes())
+				inserted++
+			}
+		}
+
+		var count int
+		_ = db.QueryRow("SELECT COUNT(*) FROM wallets").Scan(&count)
+		log.Printf("Блок %d обработан, новых адресов: %d, всего адресов: %d", i, inserted, count)
+
+		if count >= maxRows {
+			log.Println("Достигнуто максимальное количество строк:", maxRows)
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
-	wg.Wait()
 
-	fmt.Println("\nПрограмма завершена.")
-}
-
-// Проверка адреса в БД через prepared statement
-func checkAddress(stmt *sql.Stmt, addr []byte) bool {
-	row := stmt.QueryRow(addr)
-	var dummy int
-	err := row.Scan(&dummy)
-	return err == nil
-}
-
-// Сохранение в лог
-func saveToFile(w *bufio.Writer, phrase, addr, priv string) {
-	w.WriteString(fmt.Sprintf("Seed: %s\n", phrase))
-	w.WriteString(fmt.Sprintf("Address: %s\n", addr))
-	w.WriteString(fmt.Sprintf("Private: %s\n\n", priv))
-	w.Flush()
 }
